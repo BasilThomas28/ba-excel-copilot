@@ -132,10 +132,22 @@ def get_api_key():
     return None
 
 
+@st.cache_resource
+def get_client(api_key):
+    """Create the Gemini client once and reuse it across requests."""
+    return genai.Client(api_key=api_key)
+
+
+@st.cache_resource
+def model_memory():
+    """Shared memory of which model worked last and which ones don't exist."""
+    return {"last_good": None, "unavailable": set()}
+
+
 def call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model="Auto (fallback)"):
     """
-    Call Google Gemini API with automatic fallback and retry logic.
-    Returns: (response_text, model_used) or (None, None) on failure
+    Call Google Gemini API with automatic fallback, streaming the answer.
+    Returns: (generator of text chunks, model_used) or (None, None) on failure
     """
     api_key = get_api_key()
     if not api_key:
@@ -145,7 +157,7 @@ def call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model
         )
         return None, None
 
-    client = genai.Client(api_key=api_key)
+    client = get_client(api_key)
 
     if mode == "formula_builder":
         system_prompt = """You are an Excel formula expert for Business Analysts.
@@ -194,29 +206,53 @@ Generate only deterministic formulas—no calculations."""
 
         full_prompt = f"{system_prompt}\n\n{schema_text}\n\nBA Scenario: {user_question}"
 
-    # Determine which models to try
+    # Determine which models to try. In Auto mode, start with the model that
+    # worked last time so we don't waste time on unavailable ones.
     if selected_model == "Auto (fallback)":
-        models_to_try = MODELS
+        memory = model_memory()
+        last_good = memory.get("last_good")
+        models_to_try = [m for m in MODELS if m not in memory["unavailable"]]
+        if last_good in models_to_try:
+            models_to_try.remove(last_good)
+            models_to_try.insert(0, last_good)
     else:
+        memory = None
         models_to_try = [selected_model]
 
     # Try each model in order
     for model in models_to_try:
         try:
-            response = client.models.generate_content(model=model, contents=full_prompt)
-            return response.text, model
+            stream = iter(client.models.generate_content_stream(model=model, contents=full_prompt))
+            # Errors (missing model, rate limit) surface on the first chunk
+            first_chunk = next(stream, None)
         except Exception as e:
             error_str = str(e)
-            # Retry on 503 (unavailable), 429 (rate limit), or 404 (model not available)
-            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RATE_LIMIT" in error_str or "404" in error_str or "NOT_FOUND" in error_str:
-                time.sleep(2)
+            if "404" in error_str or "NOT_FOUND" in error_str:
+                # Model doesn't exist for this key: skip it now and on later requests
+                if memory is not None:
+                    memory["unavailable"].add(model)
+                continue
+            if "503" in error_str or "UNAVAILABLE" in error_str or "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                # Busy or rate-limited: short pause, then try the next model
+                time.sleep(0.5)
                 continue
             # Stop on other errors (400, 403, etc.)
-            else:
-                st.error(f"❌ Gemini API Error: {e}")
-                return None, None
+            st.error(f"❌ Gemini API Error: {e}")
+            return None, None
 
-    # All models failed with 503/429
+        if memory is not None:
+            memory["last_good"] = model
+
+        def text_chunks(first=first_chunk, rest=stream):
+            if first is not None and first.text:
+                yield first.text
+            for chunk in rest:
+                if chunk.text:
+                    yield chunk.text
+
+        return text_chunks(), model
+
+    # All models failed with 503/429/404
     st.error("🔄 Gemini is busy right now. Please try again in a minute.")
     return None, None
 
@@ -308,6 +344,7 @@ def main():
             placeholder="E.g., I have customer sales data. I need to analyze which products are trending..."
         )
 
+    streamed_now = False
     if st.button(f"Generate {'Formula' if mode == 'formula_builder' else 'BA Workflow'}", type="primary"):
         if not user_question.strip():
             st.warning("⚠️ Please enter a question or description.")
@@ -315,22 +352,35 @@ def main():
             schema_text = format_schema_for_prompt(schema)
 
             with st.spinner("🤖 Calling Gemini AI..."):
-                response, model_used = call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model)
+                chunks, model_used = call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model)
 
-            if response:
-                # Keep the result in session state so it stays on screen
-                # when the user clicks Download or changes another widget
-                st.session_state["result"] = {
-                    "text": response,
-                    "model": model_used,
-                    "mode": mode,
-                    "file": uploaded_file.name,
-                }
+            if chunks:
+                st.subheader("✅ Result")
+                # Show the answer word by word as Gemini writes it
+                try:
+                    response = st.write_stream(chunks)
+                except Exception as e:
+                    st.error(f"❌ The answer was cut off: {e}")
+                    response = None
+                if isinstance(response, list):
+                    response = "".join(str(part) for part in response)
+
+                if response:
+                    streamed_now = True
+                    # Keep the result in session state so it stays on screen
+                    # when the user clicks Download or changes another widget
+                    st.session_state["result"] = {
+                        "text": response,
+                        "model": model_used,
+                        "mode": mode,
+                        "file": uploaded_file.name,
+                    }
 
     result = st.session_state.get("result")
     if result and result["file"] == uploaded_file.name:
-        st.subheader("✅ Result")
-        st.markdown(result["text"])
+        if not streamed_now:  # already shown while streaming on this run
+            st.subheader("✅ Result")
+            st.markdown(result["text"])
 
         if result["model"]:
             st.caption(f"📡 Generated with: {result['model']}")
