@@ -1,5 +1,9 @@
 # BA Excel Copilot 🧮
 
+[![Live demo](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://ba-excel-copilot-basil.streamlit.app/)
+
+**▶ Try it:** open the [live demo](https://ba-excel-copilot-basil.streamlit.app/), upload the [sample sales workbook](https://github.com/BasilThomas28/ba-excel-copilot/raw/main/sample_data/sample_sales.xlsx), and ask *"Total revenue for the East region"*.
+
 A Streamlit web app that turns a plain-English business question into an **exact, copy-pasteable Excel formula** that uses your workbook's real sheet names and column letters. It can also plan a whole Business Analyst project. It runs on Google Gemini.
 
 Built by [Basil Thomas](https://www.linkedin.com/in/basil-thomas-0408on28/), a Data Analyst working with SQL, Power BI and Excel.
