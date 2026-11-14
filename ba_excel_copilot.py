@@ -4,6 +4,13 @@ import google.genai as genai
 import os
 import time
 from io import BytesIO
+from dotenv import load_dotenv
+
+# Load GEMINI_API_KEY / GOOGLE_API_KEY from a local .env file if present
+load_dotenv()
+
+# Accepted names for the Gemini API key (first one found wins)
+API_KEY_NAMES = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
 # Model fallback list (in order of preference)
 MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
@@ -20,68 +27,74 @@ def column_index_to_letter(index):
     return result
 
 
-def extract_excel_schema(uploaded_file):
+@st.cache_data(show_spinner=False, max_entries=5)
+def load_workbook(file_bytes):
     """
-    Extract structural metadata from Excel file (first 3 rows only).
-    Returns: Dict with sheet info, headers, dtypes, and sample values.
+    Read every sheet of the workbook once and cache it, so clicking widgets
+    doesn't re-read the file. Returns: (dict of sheet_name -> DataFrame, dict of sheet_name -> error).
     """
-    excel_file = pd.ExcelFile(uploaded_file)
-    schema = {}
-
+    sheets, errors = {}, {}
+    excel_file = pd.ExcelFile(BytesIO(file_bytes))
     for sheet_name in excel_file.sheet_names:
         try:
-            df = pd.read_excel(uploaded_file, sheet_name=sheet_name, nrows=3)
-            if df.empty:
-                continue
-
-            sheet_info = {
-                "sheet_name": sheet_name,
-                "columns": []
-            }
-
-            for col_idx, col_name in enumerate(df.columns):
-                col_letter = column_index_to_letter(col_idx)
-                col_dtype = str(df[col_name].dtype)
-
-                # Extract up to 3 non-null sample values
-                samples = df[col_name].dropna().head(3).tolist()
-                samples = [str(v) for v in samples]
-
-                sheet_info["columns"].append({
-                    "column_letter": col_letter,
-                    "header_name": col_name,
-                    "dtype": col_dtype,
-                    "samples": samples
-                })
-
-            schema[sheet_name] = sheet_info
-
+            sheets[sheet_name] = pd.read_excel(excel_file, sheet_name=sheet_name)
         except Exception as e:
-            st.warning(f"Could not read sheet '{sheet_name}': {e}")
+            errors[sheet_name] = str(e)
+    return sheets, errors
+
+
+def extract_excel_schema(sheets):
+    """
+    Extract structural metadata from each sheet.
+    Data types are inferred from the whole column, but only the first 3
+    non-empty values per column are kept as samples (these are sent to Gemini).
+    Returns: Dict with sheet info, headers, dtypes, row range and sample values.
+    """
+    schema = {}
+
+    for sheet_name, df in sheets.items():
+        if df.empty:
+            continue
+
+        sheet_info = {
+            "sheet_name": sheet_name,
+            "data_rows": len(df),
+            # Row 1 is the header, so data runs from row 2 to row len(df)+1
+            "last_row": len(df) + 1,
+            "columns": []
+        }
+
+        for col_idx, col_name in enumerate(df.columns):
+            samples = [str(v) for v in df[col_name].dropna().head(3).tolist()]
+
+            sheet_info["columns"].append({
+                "column_letter": column_index_to_letter(col_idx),
+                "header_name": col_name,
+                "dtype": str(df[col_name].dtype),
+                "samples": samples
+            })
+
+        schema[sheet_name] = sheet_info
 
     return schema
 
 
-def data_quality_check(uploaded_file):
+def data_quality_check(sheets, errors):
     """
     Perform lightweight data quality checks on all sheets.
     Returns: Dict with quality metrics per sheet.
     """
-    excel_file = pd.ExcelFile(uploaded_file)
     quality_report = {}
 
-    for sheet_name in excel_file.sheet_names:
-        try:
-            df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-
-            quality_report[sheet_name] = {
-                "total_rows": len(df),
-                "total_cols": len(df.columns),
-                "null_counts": df.isnull().sum().to_dict(),
-                "duplicate_rows": df.duplicated().sum()
-            }
-        except Exception as e:
-            quality_report[sheet_name] = {"error": str(e)}
+    for sheet_name, df in sheets.items():
+        quality_report[sheet_name] = {
+            "total_rows": len(df),
+            "total_cols": len(df.columns),
+            "null_counts": {str(k): int(v) for k, v in df.isnull().sum().items()},
+            "duplicate_rows": int(df.duplicated().sum())
+        }
+    for sheet_name, err in errors.items():
+        quality_report[sheet_name] = {"error": err}
 
     return quality_report
 
@@ -92,6 +105,10 @@ def format_schema_for_prompt(schema):
 
     for sheet_name, sheet_info in schema.items():
         schema_text += f"### Sheet: {sheet_name}\n"
+        schema_text += (
+            f"Headers in row 1; data in rows 2-{sheet_info['last_row']} "
+            f"({sheet_info['data_rows']} data rows)\n"
+        )
         for col in sheet_info["columns"]:
             schema_text += f"- Column {col['column_letter']}: '{col['header_name']}' (Type: {col['dtype']}, Samples: {', '.join(col['samples'])})\n"
         schema_text += "\n"
@@ -99,22 +116,33 @@ def format_schema_for_prompt(schema):
     return schema_text
 
 
+def get_api_key():
+    """Find the Gemini key: Streamlit secrets first, then environment / .env."""
+    for name in API_KEY_NAMES:
+        try:
+            value = st.secrets.get(name)
+        except Exception:  # no secrets.toml present
+            value = None
+        if value:
+            return value
+    for name in API_KEY_NAMES:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 def call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model="Auto (fallback)"):
     """
     Call Google Gemini API with automatic fallback and retry logic.
     Returns: (response_text, model_used) or (None, None) on failure
     """
-    # Load API key with priority: st.secrets > environment variable
-    try:
-        api_key = st.secrets.get("GEMINI_API_KEY")
-    except (KeyError, FileNotFoundError):
-        api_key = None
-
+    api_key = get_api_key()
     if not api_key:
-        api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        st.error("❌ API key not found. Add GEMINI_API_KEY to .streamlit/secrets.toml or set GEMINI_API_KEY environment variable.")
+        st.error(
+            "❌ API key not found. Add GEMINI_API_KEY to .streamlit/secrets.toml, "
+            "a .env file, or an environment variable (GOOGLE_API_KEY also works)."
+        )
         return None, None
 
     client = genai.Client(api_key=api_key)
@@ -223,14 +251,20 @@ def main():
     uploaded_file = st.file_uploader("Choose an .xlsx file", type=["xlsx"])
 
     if uploaded_file is None:
+        st.session_state.pop("result", None)
         st.info("👆 Upload an Excel file to get started.")
         return
 
-    # Extract Schema
+    # Extract Schema (workbook is read once and cached by file content)
     st.subheader("Step 2: File Analysis")
     with st.spinner("Extracting schema..."):
-        schema = extract_excel_schema(uploaded_file)
-        quality_report = data_quality_check(uploaded_file)
+        try:
+            sheets, sheet_errors = load_workbook(uploaded_file.getvalue())
+        except Exception as e:
+            st.error(f"❌ Could not open this file as an Excel workbook: {e}")
+            return
+        schema = extract_excel_schema(sheets)
+        quality_report = data_quality_check(sheets, sheet_errors)
 
     if not schema:
         st.error("❌ Could not extract schema from the Excel file. Ensure it has headers in row 1.")
@@ -277,35 +311,37 @@ def main():
     if st.button(f"Generate {'Formula' if mode == 'formula_builder' else 'BA Workflow'}", type="primary"):
         if not user_question.strip():
             st.warning("⚠️ Please enter a question or description.")
-            return
+        else:
+            schema_text = format_schema_for_prompt(schema)
 
-        schema_text = format_schema_for_prompt(schema)
+            with st.spinner("🤖 Calling Gemini AI..."):
+                response, model_used = call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model)
 
-        with st.spinner("🤖 Calling Gemini AI..."):
-            response, model_used = call_gemini_api(schema_text, user_question, mode, tutor_mode, selected_model)
+            if response:
+                # Keep the result in session state so it stays on screen
+                # when the user clicks Download or changes another widget
+                st.session_state["result"] = {
+                    "text": response,
+                    "model": model_used,
+                    "mode": mode,
+                    "file": uploaded_file.name,
+                }
 
-        if response:
-            st.subheader("✅ Result")
-            st.markdown(response)
+    result = st.session_state.get("result")
+    if result and result["file"] == uploaded_file.name:
+        st.subheader("✅ Result")
+        st.markdown(result["text"])
 
-            if model_used:
-                st.caption(f"📡 Generated with: {model_used}")
+        if result["model"]:
+            st.caption(f"📡 Generated with: {result['model']}")
 
-            # Offer download option
-            if mode == "formula_builder":
-                st.download_button(
-                    label="📋 Copy as Text",
-                    data=response,
-                    file_name="formula_output.txt",
-                    mime="text/plain"
-                )
-            else:
-                st.download_button(
-                    label="📋 Copy as Text",
-                    data=response,
-                    file_name="ba_workflow.txt",
-                    mime="text/plain"
-                )
+        st.download_button(
+            label="📥 Download as text",
+            data=result["text"],
+            file_name="formula_output.txt" if result["mode"] == "formula_builder" else "ba_workflow.txt",
+            mime="text/plain",
+            on_click="ignore",
+        )
 
 
 if __name__ == "__main__":
